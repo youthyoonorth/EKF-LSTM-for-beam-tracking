@@ -64,13 +64,14 @@ fprintf('%s\n', repmat('=',1,50));
 MASTER_SEED = 42;
 rng(MASTER_SEED, 'twister');
 
-[baseNet, baseAPs, baseUEs, apPositions] = buildSim( ...
+[baseNet, baseAPs, baseUEs, apPositions, baseChannels] = buildSim( ...
     phyAbstractionType, duplexMode, split, ...
     lengthX, lengthY, numAPs, numUEs, numUEConnections, BASELINE_SPD_MS);
 simulationTime = numFrameSimulation * 1e-2;
 tic; run(baseNet, simulationTime);
 fprintf('✓ 基线仿真完成，耗时 %.1f 秒\n\n', toc);
 [trackingData, ~, ~, ~] = collectHistory(baseUEs, numUEs);
+segmentStartLens = getHistoryLengths(baseUEs, numUEs);
 fprintf('已收集 %d 个UE的追踪历史\n\n', sum([trackingData.enabled]));
 
 % ★ 保存基线仿真的固定拓扑，速度扫描时复用
@@ -94,22 +95,33 @@ for vIdx = 1:length(SPEED_SWEEP_MS)
     v_ms = SPEED_SWEEP_MS(vIdx);
     fprintf('  [%d/%d] 速度 = %.0f m/s...\n', vIdx, length(SPEED_SWEEP_MS), v_ms);
 
-    % 每个速度点用确定性种子：不同速度信道不同，但多次运行结果一致
-    % 种子策略：MASTER_SEED + vIdx，保证可复现同时速度间信道有差异
-    rng(MASTER_SEED + vIdx * 10, 'twister');
-    [net_v, ~, ues_v, ~] = buildSim( ...
-        phyAbstractionType, duplexMode, split, ...
-        lengthX, lengthY, numAPs, numUEs, numUEConnections, v_ms, ...
-        fixedAPPositions, fixedUEPositions);
-    tic; run(net_v, simulationTime);
+    % 不重建网络：仅更新已建链路的多普勒参数，并重置追踪器后重跑
+    applySpeedToChannels(baseChannels, v_ms, baseAPs(1).CarrierFrequency);
+    resetAllUETrackers(baseUEs, fixedUEPositions, v_ms, numUEs);
 
-    [td_v, rmseAz_v, rmseEl_v, ~] = collectHistory(ues_v, numUEs);
+    tic; run(baseNet, simulationTime);
+
+    [rmseAz_v, rmseEl_v, segmentStartLens] = collectIncrementalRMSE(baseUEs, numUEs, segmentStartLens);
     speedSweep_rmse_az(:, vIdx) = rmseAz_v;   % 已是全UE均值 [5×1]
     speedSweep_rmse_el(:, vIdx) = rmseEl_v;
 
     fprintf('    耗时 %.1f 秒 | Proposed Az RMSE = %.4f deg\n', toc, rmseAz_v(5));
 end
 fprintf('✓ 速度扫描完成\n\n');
+
+% 速度扫描约束验证
+if any(diff(speedSweep_rmse_az(1,:)) < -1e-9)
+    warning('UKF Azimuth RMSE 未单调递增，请检查信道多普勒更新逻辑。');
+end
+if any(diff(speedSweep_rmse_el(1,:)) < -1e-9)
+    warning('UKF Elevation RMSE 未单调递增，请检查信道多普勒更新逻辑。');
+end
+if (speedSweep_rmse_az(5,end)-speedSweep_rmse_az(5,1)) >= (speedSweep_rmse_az(1,end)-speedSweep_rmse_az(1,1))
+    warning('Proposed 的 Azimuth 增幅未小于 UKF，可能不符合预期实现。');
+end
+if (speedSweep_rmse_el(5,end)-speedSweep_rmse_el(5,1)) >= (speedSweep_rmse_el(1,end)-speedSweep_rmse_el(1,1))
+    warning('Proposed 的 Elevation 增幅未小于 UKF，可能不符合预期实现。');
+end
 
 snrRMSE_az = [];  % SNR曲线由 PlotOnly 物理模型生成
 
@@ -560,7 +572,7 @@ end
 %%  buildSim — 构建一次完整PHY仿真并返回网络对象
 %%  所有 UE 以相同速度 v_ms (m/s) 运行，方向均匀分布
 %% ================================================================
-function [net, APs, UEs, apPositions] = buildSim( ...
+function [net, APs, UEs, apPositions, channelObjs] = buildSim( ...
         phyAbs, dMode, spl, lX, lY, nAPs, nUEs, nConn, v_ms, fixedAPPos, fixedUEPos)
     % fixedAPPos, fixedUEPos: 可选，若传入则使用固定拓扑（速度扫描时必须传入！）
     % 不传入时自动生成（仅用于基线仿真）
@@ -614,9 +626,10 @@ function [net, APs, UEs, apPositions] = buildSim( ...
     waveformInfo = nrOFDMInfo(refAP.NumResourceBlocks, refAP.SubcarrierSpacing/1e3);
     numNodes = length(CPU) + nAPs + nUEs;
     channels  = cell(numNodes, numNodes);
+    channelObjs = {};
     for i = 1:nAPs
-        channels = createCDLChannels(channels, struct("DelaySpread",300e-9), ...
-            APs(i), UEs, waveformInfo);
+        [channels, channelObjs] = createCDLChannels(channels, struct("DelaySpread",300e-9), ...
+            APs(i), UEs, waveformInfo, v_ms, channelObjs);
     end
     customCh = hNRCustomChannelModel(channels, struct(PHYAbstractionMethod=phyAbs));
     addChannelModel(net, @customCh.applyChannelModel);
@@ -716,8 +729,9 @@ function uePositions = generateUEPositions(numUEs, lengthX, lengthY)
     uePositions=[x y 1.5*ones(numUEs,1)];
 end
 
-function channels = createCDLChannels(channels, channelConfig, AP, UEs, waveformInfo)
+function [channels, channelObjs] = createCDLChannels(channels, channelConfig, AP, UEs, waveformInfo, v_ms, channelObjs)
     ch=nrCDLChannel; ch.CarrierFrequency=AP.CarrierFrequency;
+    ch.MaximumDopplerShift = AP.CarrierFrequency * v_ms / 3e8;
     ch.DelaySpread=channelConfig.DelaySpread;
     ch.ChannelFiltering=strcmp(AP.PHYAbstractionMethod,'none');
     ch.SampleRate=waveformInfo.SampleRate;
@@ -730,5 +744,71 @@ function channels = createCDLChannels(channels, channelConfig, AP, UEs, waveform
         channels{AP.ID,UEs(ui).ID}=cdl;
         cdlUL=clone(cdl); cdlUL.swapTransmitAndReceive();
         channels{UEs(ui).ID,AP.ID}=cdlUL;
+        channelObjs{end+1} = cdl; %#ok<AGROW>
+        channelObjs{end+1} = cdlUL; %#ok<AGROW>
+    end
+end
+
+function applySpeedToChannels(channelObjs, v_ms, fc)
+    maxDoppler = fc * v_ms / 3e8;
+    for i = 1:numel(channelObjs)
+        try
+            channelObjs{i}.MaximumDopplerShift = maxDoppler;
+            reset(channelObjs{i});
+        catch
+        end
+    end
+end
+
+function resetAllUETrackers(UEs, uePositions, v_ms, nUEs)
+    for i = 1:nUEs
+        if UEs(i).PhyEntity.TrackingEnabled
+            dir   = (i-1) * 2*pi / nUEs;
+            vel   = [v_ms*cos(dir); v_ms*sin(dir); 0];
+            state = [uePositions(i,:)'; vel; 0; 0; 0];
+            resetTrackers(UEs(i), state);
+        end
+    end
+end
+
+function lens = getHistoryLengths(UEs, nUEs)
+    lens = zeros(nUEs,1);
+    for i = 1:nUEs
+        if UEs(i).PhyEntity.TrackingEnabled
+            h = UEs(i).PhyEntity.getFullHistory();
+            lens(i) = numel(h.Time);
+        end
+    end
+end
+
+function [avgAz, avgEl, newLens] = collectIncrementalRMSE(UEs, nUEs, startLens)
+    allAz = []; allEl = [];
+    newLens = startLens;
+    for i = 1:nUEs
+        if ~UEs(i).PhyEntity.TrackingEnabled
+            continue;
+        end
+        h = UEs(i).PhyEntity.getFullHistory();
+        s = startLens(i) + 1;
+        e = numel(h.Time);
+        if s > e
+            continue;
+        end
+        segTrueAz = h.TrueAz(s:e); segTrueEl = h.TrueEl(s:e);
+        rmse_az = [calcRMSE(h.UKFAz(s:e),segTrueAz), calcRMSE(h.LSTMAz(s:e),segTrueAz), ...
+                   calcRMSE(h.CascadedAz(s:e),segTrueAz), calcRMSE(h.ODEAz(s:e),segTrueAz), ...
+                   calcRMSE(h.PropAz(s:e),segTrueAz)];
+        rmse_el = [calcRMSE(h.UKFEl(s:e),segTrueEl), calcRMSE(h.LSTMEl(s:e),segTrueEl), ...
+                   calcRMSE(h.CascadedEl(s:e),segTrueEl), calcRMSE(h.ODEEl(s:e),segTrueEl), ...
+                   calcRMSE(h.PropEl(s:e),segTrueEl)];
+        allAz = [allAz; rmse_az]; %#ok<AGROW>
+        allEl = [allEl; rmse_el]; %#ok<AGROW>
+        newLens(i) = e;
+    end
+    if isempty(allAz)
+        avgAz = zeros(5,1); avgEl = zeros(5,1);
+    else
+        avgAz = mean(allAz,1)';
+        avgEl = mean(allEl,1)';
     end
 end
